@@ -7,15 +7,16 @@
 #include <iostream>
 #include <utility>
 #include <vector>
-
+#include <random>
 
 namespace VCX::Labs::Fluid {
+    const int SOLID_CELL = 0, FLUID_CELL = 1, EMPTY_CELL = 2;
     struct Simulator {
         std::vector<glm::vec3> m_particlePos; // Particle m_particlePos
         std::vector<glm::vec3> m_particleVel; // Particle Velocity
         std::vector<glm::vec3> m_particleColor;
 
-        float m_fRatio;
+        float m_fRatio = .97f;
         int   m_iCellX;
         int   m_iCellY;
         int   m_iCellZ;
@@ -26,9 +27,11 @@ namespace VCX::Labs::Fluid {
         int   m_iNumSpheres;
         float m_particleRadius;
 
+        int resolution;
+
         std::vector<glm::vec3> m_vel;
         std::vector<glm::vec3> m_pre_vel;
-        std::vector<float>     m_near_num[3];
+        std::vector<glm::vec3> m_near_num;
 
         std::vector<int> m_hashtable;
         std::vector<int> m_hashtableindex;
@@ -40,72 +43,87 @@ namespace VCX::Labs::Fluid {
                                               // m_type = FLUID_CELL if has particle and m_s == 1;
                                               // m_type = EMPTY_CELL if has No particle and m_s == 1;
         std::vector<float> m_particleDensity; // Particle Density per cell, saved in the grid cell
-        float              m_particleRestDensity;
+        float              m_particleRestDensity = .5f;
 
         glm::vec3 gravity { 0, -9.81f, 0 };
+        const float boundary_size = .5f;
+
+        glm::vec3 sphere_center { 0, .5f, 0 };
+        glm::vec3 sphere_velocity { 0, 0, 0 };
+        float sphere_radius = .2f;
+        bool isSphereHeld = false;  // True when user is dragging the sphere
+        float sphere_damping = 0.98f;  // Velocity damping when not held (1.0 = no damping, 0.0 = full stop)
 
         void integrateParticles(float timeStep);
         void pushParticlesApart(int numIters);
         void handleParticleCollisions(glm::vec3 obstaclePos, float obstacleRadius, glm::vec3 obstacleVel);
         void updateParticleDensity();
 
-        void        transferVelocities(bool toGrid, float flipRatio);
-        void        solveIncompressibility(int numIters, float dt, float overRelaxation, bool compensateDrift);
-        void        updateParticleColors();
+        void transferVelocities(bool toGrid, float flipRatio);
+        void solveIncompressibility(int numIters, float dt, float overRelaxation, bool compensateDrift);
+        void solveIncompressibility_CG(int numIters, float dt, bool compensateDrift);
+        void updateParticleColors(int type);
+        
+        // Color gradient helpers
+        glm::vec3   getGradientColor(float t, 
+            const glm::vec3& c1, const glm::vec3& c2, 
+            const glm::vec3& c3, const glm::vec3& c4, const glm::vec3& c5);
+        glm::vec3   getGradientColor(float t, 
+            const glm::vec3& c1, const glm::vec3& c2, const glm::vec3& c3);
+        glm::vec3   estimateVorticity(int particleIdx);
+        
         inline bool isValidVelocity(int i, int j, int k, int dir);
         inline int  index2GridOffset(glm::ivec3 index);
+        inline int  index2GridOffset(int x, int y, int z);
 
-        void SimulateTimestep(float const dt) {
+        void SimulateTimestep(float const dt, int type, bool useCGSolver) {
             int   numSubSteps       = 1;
             int   numParticleIters  = 5;
             int   numPressureIters  = 30;
             bool  separateParticles = true;
-            float overRelaxation    = 0.5;
+            float overRelaxation    = 1.5f;
             bool  compensateDrift   = true;
 
             float     flipRatio = m_fRatio;
-            glm::vec3 obstaclePos(0.0f); // obstacle can be moved with mouse, as a user interaction
-            glm::vec3 obstacleVel(0.0f);
 
             float sdt = dt / numSubSteps;
 
             for (int step = 0; step < numSubSteps; step++) {
                 integrateParticles(sdt);
-                handleParticleCollisions(obstaclePos, 0.0, obstacleVel);
+                handleParticleCollisions(sphere_center, sphere_radius, sphere_velocity);
                 if (separateParticles)
                     pushParticlesApart(numParticleIters);
-                handleParticleCollisions(obstaclePos, 0.0, obstacleVel);
+                handleParticleCollisions(sphere_center, sphere_radius, sphere_velocity);
                 transferVelocities(true, flipRatio);
                 updateParticleDensity();
-                solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
+                if (useCGSolver) {
+                    solveIncompressibility_CG(numPressureIters, sdt, compensateDrift);
+                } else {
+                    solveIncompressibility(numPressureIters, sdt, overRelaxation, compensateDrift);
+                }
                 transferVelocities(false, flipRatio);
             }
-            updateParticleColors();
+            updateParticleColors(type);
         }
 
+        /*
+         * Initialization: 
+         * The tank is a cube with side length 2 * boundary_size, centered at the origin.
+         * res determines the number of cells in each dimension.
+         * The cell is (res + 2) ^ 3, and the boundary cell is solid.
+         * Each cell has one particle in the center originally.
+         */
         void setupScene(int res) {
-            glm::vec3 tank(1.0f);
-            glm::vec3 relWater = { 0.6f, 0.8f, 0.6f };
-
-            float _h      = tank.y / res;
-            float point_r = 0.3 * _h;
-            float dx      = 2.0 * point_r;
-            float dy      = sqrt(3.0) / 2.0 * dx;
-            float dz      = dx;
-
-            int numX = floor((relWater.x * tank.x - 2.0 * _h - 2.0 * point_r) / dx);
-            int numY = floor((relWater.y * tank.y - 2.0 * _h - 2.0 * point_r) / dy);
-            int numZ = floor((relWater.z * tank.z - 2.0 * _h - 2.0 * point_r) / dz);
-
+            resolution = res;
             // update object member attributes
-            m_iNumSpheres    = numX * numY * numZ;
-            m_iCellX         = res + 1;
-            m_iCellY         = res + 1;
-            m_iCellZ         = res + 1;
-            m_h              = 1.0 / float(res);
-            m_fInvSpacing    = float(res);
+            m_iNumSpheres    = res * (res / 2) * (res / 2);
+            m_iCellX         = res + 2;
+            m_iCellY         = res + 2;
+            m_iCellZ         = res + 2;
             m_iNumCells      = m_iCellX * m_iCellY * m_iCellZ;
-            m_particleRadius = point_r; // modified
+            m_h              = 2 * boundary_size / float(res); // the size of each cell
+            m_fInvSpacing    = 1 / m_h; // the inverse of the size of each cell
+            m_particleRadius = 0.5 * m_h; // the radius of each particle
 
             // update particle array
             m_particlePos.clear();
@@ -124,10 +142,8 @@ namespace VCX::Labs::Fluid {
             m_vel.resize(m_iNumCells, glm::vec3(0.0f));
             m_pre_vel.clear();
             m_pre_vel.resize(m_iNumCells, glm::vec3(0.0f));
-            for (int i = 0; i < 3; ++i) {
-                m_near_num[i].clear();
-                m_near_num[i].resize(m_iNumCells, 0.0f);
-            }
+            m_near_num.clear();
+            m_near_num.resize(m_iNumCells, glm::vec3(0.0f));
 
             m_p.clear();
             m_p.resize(m_iNumCells, 0.0);
@@ -139,28 +155,32 @@ namespace VCX::Labs::Fluid {
             m_particleDensity.resize(m_iNumCells, 0.0f);
 
             // the rest density can be assigned after scene initialization
-            m_particleRestDensity = 0.0;
 
             // create particles
             int p = 0;
-            for (int i = 0; i < numX; i++) {
-                for (int j = 0; j < numY; j++) {
-                    for (int k = 0; k < numZ; k++) {
-                        m_particlePos[p++] = glm::vec3(m_h + point_r + dx * i + (j % 2 == 0 ? 0.0 : point_r), m_h + point_r + dy * j, m_h + point_r + dz * k + (j % 2 == 0 ? 0.0 : point_r)) + glm::vec3(-0.5f);
+            std::mt19937 rng(std::random_device{}());
+            std::uniform_real_distribution<float> offset_distribution(-0.5f, 0.5f);
+            for (int i = 0; i < res; i++) {
+                for (int j = 0; j < res / 2; j++) {
+                    for (int k = 0; k < res / 2; k++) {
+                        glm::vec3 random_offset(
+                            offset_distribution(rng),
+                            offset_distribution(rng),
+                            offset_distribution(rng)
+                        );
+                        m_particlePos[p ++] = (glm::vec3(i, j, k) + random_offset + 0.5f) * m_h - boundary_size;
                     }
                 }
             }
             // setup grid cells for tank
-            int n = m_iCellY * m_iCellZ;
-            int m = m_iCellZ;
 
             for (int i = 0; i < m_iCellX; i++) {
                 for (int j = 0; j < m_iCellY; j++) {
                     for (int k = 0; k < m_iCellZ; k++) {
                         float s = 1.0; // fluid
-                        if (i == 0 || i >= m_iCellX - 2 || j == 0 || j >= m_iCellY - 2 || k == 0 || k >= m_iCellZ - 2)
+                        if (i == 0 || i == m_iCellX - 1 || j == 0 || j == m_iCellY - 1 || k == 0 || k == m_iCellZ - 1)
                             s = 0.0f; // solid
-                        m_s[i * n + j * m + k] = s;
+                        m_s[index2GridOffset(i, j, k)] = s;
                     }
                 }
             }
